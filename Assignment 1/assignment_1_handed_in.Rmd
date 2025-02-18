@@ -335,7 +335,7 @@ ggplot(df) + theme_classic() +
   labs(
     title = "Asymmetrical WSLS Agent (red) vs Biased Random Opponent (0.7 rate) (blue)",
     x = "Trial Number",
-    y = "Cumulative probability of choosing 1 (0-1)",
+    y = "Cumulative success",
     color = "Agent Type"
   )
 ```
@@ -350,7 +350,7 @@ ggplot(df_2) + theme_classic() +
   labs(
     title = "Asymmetrical WSLS Agent (red) vs Traditional WSLS Agent Opponent (blue)",
     x = "Trial Number",
-    y = "Cumulative probability of choosing 1 (0-1)",
+    y = "Cumulative success",
     color = "Agent Type"
   )
 ```
