@@ -1,0 +1,362 @@
+---
+title: "assingment_2_second"
+author: "Ida Dencker"
+date: "2025-02-24"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+
+```{r}
+pacman::p_load(tidyverse,
+        here,
+        posterior,
+        cmdstanr, # Stan need to be at least version 0.8.xxx
+        brms,
+        tidybayes,
+        cowplot,
+        gridExtra,
+        grid)
+```
+
+
+
+```{r}
+# Empty lists to store plots
+plots_list <- list()
+trace_list <- list()
+prior_p_list <- list()
+post_p_list <- list()
+prior_post_p_list <- list()
+propensity_p_list <- list()
+
+
+# Loop through all 9 values of forgetting
+value_list <- list(0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9)
+
+# We set the 'true' forgetting value to be above 0 and below 1.
+# The forgetting is the parameter we want the model to recover
+# A forgetting_raw value of X means that X% of memory is determined by the 'Others' last move, while 100-X% is retained from previous memory.
+
+# The idea here is that when the 'Other' chooses 1, memory moves closer to 1 and when the opponent chooses 0, memory moves closer to 0.
+
+# E.g. if forgetting_raw = 0.8 (which is a high forgetting value), 80% of memory is replaced each time while the remaining 20% is distributed over the remaining trials, and hence the choice of the 'Self' is very determined by the 'Others' last move. This will correspond to big jumps in memory. If the memory before is 0.5 and the 'Other chooses 1 the memory will jump all the way to 0.9. But if the 'Other' then chooses 0 the memory will jump down to only 0.19 (Big jumps)
+
+# if forgetting_raw = 0.2 (which is a low forgetting value), and memory before was 0.48 and the 'Other' chooses 0 the memory jumps only down to 0.58 (small jumps)
+
+for(i in value_list) {
+  
+  # Set n trials
+  trials <- 120
+  
+  # Make a function to simulate choices for the 'Other'
+  RandomAgentNoise_f <- function(rate, noise) {
+    choice <- rbinom(1, 1, rate) # Generating noiseless choices
+    if (rbinom(1, 1, noise) == 1) {
+      choice = rbinom(1, 1, 0.5) # Introducing noise
+    }
+    return(choice)
+  }
+  
+  # Create an empty df
+  d <- NULL
+  
+  # Fill in df with the choices of the 'Other' (the random choice maker)
+  for (noise in seq(0, 0.5, 0.1)) { # looping through noise levels
+    for (rate in seq(0, 1, 0.1)) { # looping through rate levels
+      randomChoice <- rep(NA, trials)
+      # Fill in trials with choices of other 
+      for (t in seq(trials)) { # looping through trials 
+        # Make the choice
+        randomChoice[t] <- RandomAgentNoise_f(rate, noise)
+      }
+      # Put it in a tibble 
+      temp <- tibble(trial = seq(trials), choice = randomChoice, rate, noise)
+      # Calculate the memory which corresponds to how often the 'Other' chooses 1. So if there has been 1 trial and it has been a 1 the memory is 100% (1/1). If 'Other' choose 1 again, memeory will still be 100% (2/2), but if 'Other' chooses 0 on the third trial it shifts to 0.667 (2/3). I.e. memory will change as trials progress)
+      temp$memory <- cumsum(temp$choice) / seq_along(temp$choice)
+      # Extend the df with the tibble 
+      if (exists("d")) {
+        d <- rbind(d, temp)
+      } else{
+        d <- temp
+      }
+    }
+  }
+  
+  # Subset the df to have no noise and a bias of 0.8
+  d1 <- d %>% 
+    subset(noise == 0.0 & rate == 0.8) %>% 
+    rename(Other = choice) %>% 
+    # The lag function shifts the memory by 1 space down, so memory become dependent of the former trial
+    mutate(memory = lag(memory, 1))
+  
+  
+  # Since trial 1 is, we fill memory with a 0.5 value
+  d1$memory[1] <- 0.5 # no prior info at first trial
+  # Limiting space to above 0 and below 1
+  d1$memory[d1$memory == 0] <- 0.01
+  d1$memory[d1$memory == 1] <- 0.99
+  # We set the 'true' forgetting value to be above 0 and below 1.
+  # The forgetting is the parameter we want the model to recover
+  forgetting_raw = i
+
+  
+  # Define a function that takes in the forgetting_raw, the memory and the choice of the other
+  MemoryAgent_f <- function(forgetting_raw, memory, other){
+    # Memory before and the choice of 'Other'
+    #print(paste0("Before update - memory: ", memory, ", choice of other: ", other))
+    # Make one choice at a time with the probability of memory
+    choice = rbinom(1,1, memory)
+    # Update memory where the new memory is a weighted combination of the last move of 'Other' and the previous memory
+    memory <- forgetting_raw * other + (1-forgetting_raw) * memory
+    # Memory after 
+    #print(paste0("After update - memory: ", memory))
+    # Make a tibble with the choices and the memory 
+    outcome <- tibble(choice = choice, memory = memory)
+    return(outcome)
+  }
+  
+  # Memory for the first trial is 0.5, i.e. 50/50 chance of the choice
+  memory = 0.5
+  
+  # Initialize empty column to be filled
+  d1$Self <- rep(NA, trials)
+  
+  # Simulate the choices of the 'Self' and add it to the d1 dataframe 
+  for (i in 1:trials) {
+    #print(paste0("Trial: ", i))
+    # Use the function to make the choice
+    outcome <- MemoryAgent_f(forgetting_raw, memory, d1$Other[i])
+    # The 'Self' choice is stored in the Self column.
+    d1$Self[i] <- outcome$choice
+    # Update the memory
+    memory <- outcome$memory
+    #print("------------------------------------")  # Separator for readability
+  }
+  
+  
+  # Create the data in a list format
+  data <- list(
+    n = 120,
+    h = d1$Self,
+    other = d1$Other
+  )
+  
+  # Specify path to stan model and load 
+  file<- file.path("model.stan")
+  mod <- cmdstan_model(file, 
+                       cpp_options = list(stan_threads = TRUE),
+                       stanc_options = list("O1"))
+  
+  # The following command calls Stan with specific options
+  samples <- mod$sample(
+    data = data,
+    seed = 123,
+    chains = 2, 
+    parallel_chains = 2, 
+    threads_per_chain = 2, 
+    iter_warmup = 1000,
+    iter_sampling = 1000,
+    refresh = 0,
+    max_treedepth = 20,
+    adapt_delta = 0.99,
+  )
+  
+  # Check Markov chains to scan for potential problems 
+  samples$cmdstan_diagnose()
+
+  # Print a summary of the model
+  samples$summary()
+  # Look if the mean of forgetting is approximately the same as forgetting_raw
+  
+  # Extract posterior samples and include sampling of the prior
+  draws_df <- as_draws_df(samples$draws())
+  # Check that forgetting is between 0 and 1
+  summary(draws_df$forgetting)
+  
+
+  # Prior-posterior update check
+  plot <- ggplot(draws_df) +
+    geom_density(aes(forgetting), fill = "blue", alpha = 0.3) + 
+    geom_density(aes(forgetting_prior), fill = "red", alpha = 0.3) + 
+    geom_vline(xintercept = forgetting_raw, size = 1) + # A black line for the 'true' value
+    xlab("Forgetting") +
+    ylab("Posterior Density") +
+    ggtitle(paste("True parameter is", forgetting_raw)) +
+    theme_classic() + 
+    theme(plot.title = element_text(hjust = 0.5, size=rel(0.8)))+
+    theme(axis.text.x= element_text(size=rel(0.8)))+
+    theme(axis.text=element_text(size=7),
+        axis.title=element_text(size=7,face="bold"))
+  
+  plots_list[[paste0("plot_", forgetting_raw)]] <- plot
+  
+  
+  # Trace plots: Hamiltonian MC chains
+  trace <- ggplot(draws_df,
+         aes(.iteration, forgetting, group = .chain, color = .chain))+
+    geom_line()+
+    ggtitle(paste("True parameter is", forgetting_raw)) +
+    theme_classic()+
+    theme(plot.title = element_text(hjust = 0.5, size=rel(0.8)))+
+    theme(axis.text=element_text(size=7),
+        axis.title=element_text(size=7,face="bold"))
+  
+  trace_list[[paste0("plot_", forgetting_raw)]] <- trace
+  
+  
+  # Sum to enable plotting
+  draws_df <- draws_df %>%
+    mutate(prior_preds_total = rowSums(select(., starts_with("prior_predictions[")))) %>%
+    mutate(posterior_preds_total = rowSums(select(., starts_with("posterior_predictions["))))
+
+
+  # Prior Predictive Checks
+  # Involve simulating data from our model using only the prior distributions, before seeing any actual data. This helps us understand what kinds of patterns our model assumes are possible before we begin fitting to real observations.
+  prior_p <- ggplot(draws_df, aes(x = prior_preds_total)) +
+    geom_histogram(color = "darkblue", fill = "blue", alpha = 0.3, bins = 30) +
+    xlab("Predicted right out of 120 trials") +
+    ylab("Prior Density") +
+    ggtitle(paste("True parameter is", forgetting_raw)) +
+    theme_classic()+
+    theme(plot.title = element_text(hjust = 0.5, size=rel(0.8)))+
+    theme(axis.text=element_text(size=7),
+        axis.title=element_text(size=7,face="bold"))+
+    scale_x_continuous(limits = c(0, 120)) # Ensures x-axis from 0 to 120
+  
+  prior_p_list[[paste0("plot_", forgetting_raw)]] <- prior_p
+
+  # Posterior Predictive Checks
+  # After fitting our models, posterior predictive checks help us determine whether the fitted model can reproduce key patterns in our observed data. We generate new data using parameters sampled from the posterior distribution and compare these simulations to our actual observations.
+  post_p <- ggplot(draws_df, aes(x = posterior_preds_total)) +
+    geom_histogram(color = "red", fill = "darkred", alpha = 0.3, bins = 30) +
+    xlab("Predicted right out of 120 trials") +
+    ylab("Posterior Density") +
+    ggtitle(paste("True parameter is", forgetting_raw)) +
+    theme_classic()+
+    theme(plot.title = element_text(hjust = 0.5, size=rel(0.8)))+
+    theme(axis.text=element_text(size=7),
+        axis.title=element_text(size=7,face="bold"))+
+    scale_x_continuous(limits = c(0, 120)) # Ensures x-axis from 0 to 120
+  
+  post_p_list[[paste0("plot_", forgetting_raw)]] <- post_p
+  
+  # Prior and Posterior Predictive Checks
+  # Involve simulating data from our model using only the prior distributions, before seeing any actual data. This helps us understand what kinds of patterns our model assumes are possible before we begin fitting to real observations.
+  prior_post_p <- ggplot() +
+    geom_histogram(data = draws_df,
+                   aes( x = prior_preds_total),
+                   color = "red", fill = "red", alpha = 0.1, bins = 30) +
+    geom_histogram(data = draws_df,
+                   aes(x = posterior_preds_total),
+                   color = "blue", fill = "blue", alpha = 0.1, bins = 30) +
+    xlab("Predicted right out of 120 trials") +
+    ylab("Density") +
+    ggtitle(paste("True parameter is", forgetting_raw)) +
+    theme_classic()+
+    theme(plot.title = element_text(hjust = 0.5, size=rel(0.8)))+
+    theme(axis.text=element_text(size=7),
+        axis.title=element_text(size=7,face="bold"))+
+    scale_x_continuous(limits = c(0, 120)) # Ensures x-axis from 0 to 120
+  
+  prior_post_p_list[[paste0("plot_", forgetting_raw)]] <- prior_post_p
+  
+  # Prior and posterior propensity to choose right
+  # Get the prior data in the right format (extract and organize)
+  prior_predictions <- draws_df %>%
+  dplyr::select(starts_with("prior_predictions[")) %>%
+  pivot_longer(everything(), 
+              names_to = "trial",
+              values_to = "prediction") %>%
+  mutate(trial = as.numeric(str_extract(trial, "\\d+")))
+
+  prior_summary <- prior_predictions %>%
+    group_by(trial) %>%
+    summarise(
+      mean = mean(prediction),
+      lower = quantile(prediction, 0.025),
+      upper = quantile(prediction, 0.975)
+    )
+  
+  # Get the posterior data in the right format (extract and organize)
+  posterior_predictions <- draws_df %>%
+  dplyr::select(starts_with("posterior_predictions[")) %>% # Select all posterior prediction columns
+  pivot_longer(everything(), 
+              names_to = "trial",
+              values_to = "prediction") %>%
+  # Clean up the trial number from the Stan array notation
+  mutate(trial = as.numeric(str_extract(trial, "\\d+")))
+
+  posterior_summary <- posterior_predictions %>%
+    group_by(trial) %>%
+    summarise(
+      mean = mean(prediction),
+      lower = quantile(prediction, 0.025),
+      upper = quantile(prediction, 0.975)
+    )
+  
+  # Visualize the prior and posterior propensity
+  propensity_plot <- ggplot() +
+    # Add posterior prediction interval
+    geom_ribbon(data = posterior_summary,
+                aes(x = trial, ymin = lower, ymax = upper),
+                alpha = 0.2, fill = "blue") +
+    # Add mean prior and posterior propensity
+    geom_line(data = posterior_summary,
+              aes(x = trial, y = mean),
+              color = "blue") +
+    geom_line(data = prior_summary,
+              aes(x = trial, y = mean),
+              color = "red") +
+    # Add actual data points
+    geom_point(data = tibble(trial = 1:length(data$h), 
+                            choice = data$h),
+               aes(x = trial, y = choice),
+               alpha = 0.5) +
+    xlab("Trial") +
+    ylab("Choice (0/1)") +
+    ggtitle(paste("True parameter is", forgetting_raw)) +
+    theme_classic()+
+    theme(plot.title = element_text(hjust = 0.5, size=rel(0.8)))+
+    theme(axis.text=element_text(size=7),
+          axis.title=element_text(size=7,face="bold"))
+  
+  propensity_p_list[[paste0("plot_", forgetting_raw)]] <- propensity_plot
+  
+}
+
+
+grid.arrange(grobs = plots_list, ncol = 3, nrow=3,top = textGrob("Prior Posterior Update Check",gp=gpar(fontsize=20,font=3))) 
+grid.arrange(grobs = trace_list, ncol = 3, nrow=3,top = textGrob("Traceplots",gp=gpar(fontsize=20,font=3)))  
+grid.arrange(grobs = prior_p_list, ncol = 3, nrow=3,top = textGrob("Prior Predictive Checks",gp=gpar(fontsize=20,font=3)))
+grid.arrange(grobs = prior_post_p_list, ncol = 3, nrow=3,top = textGrob("Prior and Posterior Predictive Checks",gp=gpar(fontsize=20,font=3)))
+grid.arrange(grobs = post_p_list, ncol = 3, nrow=3,top = textGrob("Posterior Predictive Checks",gp=gpar(fontsize=20,font=3)))
+grid.arrange(grobs = propensity_p_list, ncol = 3, nrow = 3, top = textGrob("Prior and Posterior Propensity to Choose Right", gp=gpar(fontsize=20,font=3)))
+
+```
+
+
+```{r}
+# New code: due to floating numbers of some values the above code does not work for some specific values of rate
+
+# Check how many unique values of rate the df holds
+#unique(d$rate)
+# Even though unique(d$rate) prints 11 unique values including e.g. 0.6, the actual stored values may have tiny decimal differences, like 0.600000000000001.
+
+# Check number of rows for the exact value of 0.6
+#nrow(d %>% filter(rate == 0.6))  
+# Returns 0, which means no exact matches for rate == 0.6
+
+# To account for values of rate that might hold tiny decimals this code can be used to subset:
+#d1 <- d %>% 
+  #filter(near(rate, 0.6, tol = 1e-6)) %>% 
+  #subset(noise == 0.0) %>% 
+  #rename(Other = choice) %>% 
+  # The lag function shifts the memory by 1 space down, so memory become dependent of the former trial
+  #mutate(memory = lag(memory, 1))
+
+```
