@@ -1,0 +1,729 @@
+---
+title: "Assignment_3"
+author: "Ida Dencker"
+date: "2025-03-18"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+
+```{r}
+pacman::p_load(tidyverse,
+        here,
+        posterior,
+        betafunctions,
+        cmdstanr, # Stan need to be at least version 0.8.xxx
+        brms,
+        updog,
+        tidybayes,
+        extraDistr,
+        cowplot,
+        loo,
+        ggplot2,
+        patchwork,
+        gridExtra,
+        grid)
+
+```
+
+
+
+```{r}
+# Load in real data 
+simonsen <- read_csv('Simonsen_clean.csv')
+
+# Explore the real data
+
+length(unique(simonsen$ID))
+# There are 40 participants
+length(unique(simonsen$FaceID))
+# Shown 153 faces
+
+#ratings can be between 1 and 8
+#feedback are -3, -2, 0, 2 or 3
+#feedback cannot be NA
+
+#ID's < 200 are the patients 
+unique(simonsen$ID)
+#these are all control
+
+
+length(unique(simonsen$Condition))
+#only 1 condition (Pre)
+
+#Hist
+hist(simonsen$FirstRating)
+hist(simonsen$GroupRating)
+hist(simonsen$Feedback)
+hist(simonsen$SecondRating)
+hist(simonsen$Change)
+# seems they are more likely to give more negative second ratings since change is negative
+
+
+```
+
+# The Game setup
+1. a person get shown a face and asked to rate trustworthiness from 1-8 (firstrating)
+2. the person give the rating
+3. the person is shown how other people rated that face (Grouprating)
+4. this is repeated for several faces
+5. the person leaves this task to do another task
+6. they are told the data got lost so they do it again
+7. the person is shown a face again and asked to rate (Secondrating)
+(obs: they are not given the group feedback again here, but have that implicitly in memory)
+8. The person is shown all the faces again (153 trials)
+(here on the second round the rater has 2 sources of information they can use: their own rating on round 1 (s1) + the group rating they were shown (s2))
+
+# Simulate 3 agents
+  1. simple agent where the ratings are taken at face value
+  2. weighted self focused agent that weight their first rating the highest
+  3. weighted socially ifluenced agent that weight the group rating the highest 
+  
+# Playing 3 games (i.e. one game each)
+# The agents have a different strategy so we can compare
+  
+  
+# What do the agents do with S1 and S2?
+  One use the S1 and S2 equally in the decision (a simple model/agent)
+  One weight the S1 and S2 so they are not equal (a weighted model/agent)
+ 
+
+```{r}
+# The simple agent
+
+# Simulating according to Simonsen data 
+
+# Go through experiment 
+
+trials <- 153 # The number of faces in Simonsen data
+
+# Initialize empty vectors
+FirstRating <- numeric(trials)
+Feedback <- numeric(trials)
+GroupRating <- numeric(trials)
+SecondRating <- numeric(trials)
+Change <- numeric(trials)
+
+
+# Define a function for calculating the second rating 
+simpleBetaBinomial <- function(alpha_prior, beta_prior, 
+                                FirstRating, total_self, 
+                                GroupRating, total_soc){
+  
+  # Compute posterior parameters
+  alpha_post <- alpha_prior +  FirstRating + GroupRating
+  beta_post <- beta_prior + (total_self - FirstRating) + (total_soc - GroupRating)
+  
+
+  # Sample from Beta-Binomial distribution
+  SecondRating <- rbbinom(1, size = 8, alpha_post, beta_post)
+  
+  
+  #only interested in the decision
+  return(SecondRating)
+}
+
+
+# Create an empty df
+simple <- NULL
+
+# Simulate for multiple participants
+for (id in seq(1,40, by=1)){
+
+  for (t in seq(trials)) { # looping through trials 
+        
+        # Sample FirstRating from normal distribution (centered around 4.5, SD = 1.5), limit to 1 and 8
+        FirstRating[t] <- round(pmin(pmax(rnorm(1, mean = 4.5, sd = 1.5), 1), 8))
+        
+        # Simulate the Feedback 
+        # Takes the FirstRating into account and define possible feedback based on that 
+        possible_feedback <- switch(as.character(FirstRating[t]),
+          "1" = c(0, 2, 3),
+          "2" = c(0, 2, 3), 
+          "3" = c(-2, 0, 2, 3),
+          "4" = c(-3, -2, 0, 2, 3),
+          "5" = c(-3, -2, 0, 2, 3),
+          "6" = c(-3, -2, 0, 2),
+          "7" = c(-3, -2, 0),
+          "8" = c(-3, -2, 0)
+        )
+        
+        # Randomly select feedback from possible options
+        Feedback[t] <- sample(possible_feedback, 1) # draw 1 sample randomly
+        
+        # Simulate the GroupRating using the feedback value
+        # just simple + or -
+        GroupRating[t] <- FirstRating[t] + Feedback[t]
+        
+        # Simulate the SecondRating using the function 
+        SecondRating[t] <-simpleBetaBinomial(
+          alpha_prior = 1, beta_prior = 1,
+          FirstRating = FirstRating[t], total_self = 8,
+          GroupRating = GroupRating[t], total_soc = 8)
+  
+        # Calculate change
+        Change[t] <- SecondRating[t] - FirstRating[t]
+        }
+  
+        # Put it in a tibble 
+        temp <- tibble(FaceID = seq(trials),
+                       FirstRating = FirstRating, 
+                       Feedback= Feedback, 
+                       GroupRating= GroupRating, 
+                       SecondRating= SecondRating, 
+                       Change= Change,
+                       ID= id)
+  
+        # Extend the df with the tibble 
+        if (exists("simple")) {
+          simple <- rbind(simple, temp)
+        } else{
+          simple <- temp
+        }
+      
+}
+
+# Due to the sampling process some second ratings are 0, which we need to change
+# if less than 1 overwrite to 1
+simple <- simple %>%
+  mutate(SecondRating = ifelse(SecondRating < 1, 1, SecondRating))
+```
+
+
+```{r}
+# The weighted agent: self-focused
+
+# Go through experiment 
+trials <- 153 # The number of faces in data
+
+
+
+# This function extends our basic model by allowing different weights for each
+# evidence source. This can represent differences in perceived reliability,
+# attention, or individual cognitive tendencies.
+
+weightedBetaBinomial <- function(alpha_prior, beta_prior, 
+                                FirstRating, total_self, 
+                                GroupRating, total_soc,
+                                weight_direct, weight_social) {
+  
+  
+  # Compute posterior parameters
+  alpha_post <- alpha_prior + (weight_direct * FirstRating) + (weight_social * GroupRating)
+  beta_post <- beta_prior + (weight_direct * (total_self - FirstRating)) + (weight_social * (total_soc - GroupRating))
+
+  # Sample from Beta-Binomial distribution
+  SecondRating <- rbbinom(1, size = 8, alpha_post, beta_post)
+  
+  
+  #only interested in the decision
+  return(SecondRating)
+}
+
+
+# Create an empty tibble
+self_foc <- tibble()
+
+
+# Simulate for multiple participants
+for (id in seq(1,40, by=1)){
+  
+  # Initialize empty vectors
+  FirstRating <- numeric(trials)
+  Feedback <- numeric(trials)
+  GroupRating <- numeric(trials)
+  SecondRating <- numeric(trials)
+
+  for (t in seq(trials)) { # looping through trials 
+        
+        # Sample FirstRating from normal distribution (centered around 4.5, SD = 1.5), limit to 1 and 8
+        FirstRating[t] <- round(pmin(pmax(rnorm(1, mean = 4.5, sd = 1.5), 1), 8))
+
+        # Define Feedback based on FirstRating
+        possible_feedback <- switch(as.character(FirstRating[t]),
+          "1" = c(0, 2, 3),
+          "2" = c(0, 2, 3),
+          "3" = c(-2, 0, 2, 3),
+          "4" = c(-3, -2, 0, 2, 3),
+          "5" = c(-3, -2, 0, 2, 3),
+          "6" = c(-3, -2, 0, 2),
+          "7" = c(-3, -2, 0),
+          "8" = c(-3, -2, 0)
+        )
+        
+        # Randomly select feedback from possible options
+        Feedback[t] <- sample(possible_feedback, 1) # draw 1 sample randomly
+        
+        # Simulate the GroupRating using the feedback value
+        # just simple + 
+        GroupRating[t] <- FirstRating[t] + Feedback[t]
+        
+        # Using the function 
+        SecondRating[t] <-weightedBetaBinomial(
+          alpha_prior = 1, beta_prior = 1,
+          FirstRating = FirstRating[t], total_self = 8,
+          GroupRating = GroupRating[t], total_soc = 8,
+          weight_direct = 1.5, #this agent is self focused
+          weight_social = 0.5 #it does not value the group rating much 
+        )
+        
+
+        
+        # Calculate change
+        Change[t] <- SecondRating[t] - FirstRating[t]
+        
+        }
+        
+        # Put it in a tibble 
+        temp <- tibble(FaceID = seq(trials),
+                       FirstRating = FirstRating, 
+                       Feedback= Feedback, 
+                       GroupRating= GroupRating, 
+                       SecondRating= SecondRating, 
+                       Change= Change,
+                       ID = id)
+  
+        # Append data
+        self_foc <- bind_rows(self_foc, temp)
+ 
+}
+
+# Due to the sampling process some second ratings are 0, which we need to change
+# if less than 1 overwrite to 1
+self_foc <- self_foc %>%
+  mutate(SecondRating = ifelse(SecondRating < 1, 1, SecondRating))
+
+```
+
+
+```{r}
+# The weighted agent: socially-influenced
+
+# Go through experiment 
+trials <- 153 # The number of faces in data
+
+
+# This function extends our basic model by allowing different weights for each
+# evidence source. This can represent differences in perceived reliability,
+# attention, or individual cognitive tendencies.
+
+weightedBetaBinomial <- function(alpha_prior, beta_prior, 
+                                FirstRating, total_self, 
+                                GroupRating, total_soc,
+                                weight_direct, weight_social) {
+  
+  
+  # Compute posterior parameters
+  alpha_post <- alpha_prior + (weight_direct * FirstRating) + (weight_social * GroupRating)
+  beta_post <- beta_prior + (weight_direct * (total_self - FirstRating)) + (weight_social * (total_soc - GroupRating))
+
+  # Sample from Beta-Binomial distribution
+  SecondRating <- rbbinom(1, size = 8, alpha_post, beta_post)
+  
+  
+  #only interested in the decision
+  return(SecondRating)
+}
+
+
+# Create an empty tibble
+soc_inf <- tibble()
+
+
+# Simulate for multiple participants
+for (id in seq(1,40, by=1)){
+  
+  # Initialize empty vectors
+  FirstRating <- numeric(trials)
+  Feedback <- numeric(trials)
+  GroupRating <- numeric(trials)
+  SecondRating <- numeric(trials)
+
+  for (t in seq(trials)) { # looping through trials 
+        
+        # Sample FirstRating from normal distribution (centered around 4.5, SD = 1.5), limit to 1 and 8
+        FirstRating[t] <- round(pmin(pmax(rnorm(1, mean = 4.5, sd = 1.5), 1), 8))
+
+        # Define Feedback based on FirstRating
+        possible_feedback <- switch(as.character(FirstRating[t]),
+          "1" = c(0, 2, 3),
+          "2" = c(0, 2, 3),
+          "3" = c(-2, 0, 2, 3),
+          "4" = c(-3, -2, 0, 2, 3),
+          "5" = c(-3, -2, 0, 2, 3),
+          "6" = c(-3, -2, 0, 2),
+          "7" = c(-3, -2, 0),
+          "8" = c(-3, -2, 0)
+        )
+        
+        # Randomly select feedback from possible options
+        Feedback[t] <- sample(possible_feedback, 1) # draw 1 sample randomly
+        
+        # Simulate the GroupRating using the feedback value
+        # just simple + 
+        GroupRating[t] <- FirstRating[t] + Feedback[t]
+        
+        # Using the function 
+        SecondRating[t] <-weightedBetaBinomial(
+          alpha_prior = 1, beta_prior = 1,
+          FirstRating = FirstRating[t], total_self = 8,
+          GroupRating = GroupRating[t], total_soc = 8,
+          weight_direct = 0.5, #it does not value the first rating much 
+          weight_social = 1.5 #this agent is socially influenced
+        )
+        
+
+        
+        # Calculate change
+        Change[t] <- SecondRating[t] - FirstRating[t]
+        
+        }
+        
+        # Put it in a tibble 
+        temp <- tibble(FaceID = seq(trials),
+                       FirstRating = FirstRating, 
+                       Feedback= Feedback, 
+                       GroupRating= GroupRating, 
+                       SecondRating= SecondRating, 
+                       Change= Change,
+                       ID = id)
+  
+        # Append data
+        soc_inf <- bind_rows(soc_inf, temp)
+ 
+}
+
+# Due to the sampling process some second ratings are 0, which we need to change
+# if less than 1 overwrite to 1
+soc_inf <- soc_inf %>%
+  mutate(SecondRating = ifelse(SecondRating < 1, 1, SecondRating))
+
+```
+
+```{r}
+# Can check the mean change
+
+summary(self_foc$Change)
+summary(soc_inf$Change)
+```
+
+
+```{r}
+# Simple model
+# Create the data in a list format
+data_simple <- list(
+  n = 6120,
+  f = simple$FirstRating,
+  g = simple$GroupRating,
+  s = simple$SecondRating,
+  fe = simple$Feedback,
+  c = simple$Change 
+)
+
+# Specify path to stan model and load 
+#file<- file.path("model_portfolio_3.stan")
+file <- file.path("simple_stan.stan")
+
+
+mod_simple <- cmdstan_model(file, 
+                     cpp_options = list(stan_threads = TRUE),
+                     stanc_options = list("O1"))
+
+# The following command calls Stan with specific options
+samples_simple <- mod_simple$sample(
+  data = data_simple,
+  seed = 123,
+  chains = 2, 
+  parallel_chains = 2, 
+  threads_per_chain = 2, 
+  iter_warmup = 1000,
+  iter_sampling = 1000,
+  refresh = 0,
+  max_treedepth = 20,
+  adapt_delta = 0.99,
+)
+
+# Print a summary of the model
+samples_simple$summary()
+samples_simple$cmdstan_diagnose()
+# Note that there will be NaN E-BFMI since the model have no parameters
+
+# Weighted self focused model
+# Create the data in a list format
+data_weighted_self_focused <- list(
+  n = 6120,
+  f = self_foc$FirstRating,
+  g = self_foc$GroupRating,
+  s = self_foc$SecondRating,
+  fe = self_foc$Feedback,
+  c = self_foc$Change 
+)
+
+# Specify path to stan model and load 
+#file<- file.path("model_portfolio_3.stan")
+file <- file.path("weighted_stan.stan")
+
+
+mod_weighted_self_focused <- cmdstan_model(file, 
+                     cpp_options = list(stan_threads = TRUE),
+                     stanc_options = list("O1"))
+
+# The following command calls Stan with specific options
+samples_weighted_self_focused <- mod_weighted_self_focused$sample(
+  data = data_weighted_self_focused,
+  seed = 123,
+  chains = 2, 
+  parallel_chains = 2, 
+  threads_per_chain = 2, 
+  iter_warmup = 1000,
+  iter_sampling = 1000,
+  refresh = 0,
+  max_treedepth = 20,
+  adapt_delta = 0.99,
+)
+
+# Print a summary of the model
+samples_weighted_self_focused$summary()
+samples_weighted_self_focused$cmdstan_diagnose()
+
+# Weighted socially focused model 
+data_weighted_socially_focused <- list(
+  n = 6120,
+  f = soc_inf$FirstRating,
+  g = soc_inf$GroupRating,
+  s = soc_inf$SecondRating,
+  fe = soc_inf$Feedback,
+  c = soc_inf$Change 
+)
+
+# Specify path to stan model and load 
+#file<- file.path("model_portfolio_3.stan")
+file <- file.path("weighted_stan.stan")
+
+
+mod_weighted_socially_focused <- cmdstan_model(file, 
+                     cpp_options = list(stan_threads = TRUE),
+                     stanc_options = list("O1"))
+
+# The following command calls Stan with specific options
+samples_weighted_socially_focused <- mod_weighted_socially_focused$sample(
+  data = data_weighted_socially_focused,
+  seed = 123,
+  chains = 2, 
+  parallel_chains = 2, 
+  threads_per_chain = 2, 
+  iter_warmup = 1000,
+  iter_sampling = 1000,
+  refresh = 0,
+  max_treedepth = 20,
+  adapt_delta = 0.99,
+)
+
+# Print a summary of the model
+samples_weighted_socially_focused$summary()
+samples_weighted_socially_focused$cmdstan_diagnose()
+```
+
+
+
+
+# Model comparison
+
+# Calculating the loo-values for our models
+```{r}
+# From the course notes: function to extract log-likelihood and compute LOO
+compute_loo <- function(model_fit) {
+  # Extract log-likelihood values
+  log_lik <- model_fit$draws("log_lik", format = "matrix")
+  
+  # Compute LOO-CV using PSIS
+  loo_result <- loo(log_lik)
+  return(loo_result)
+}
+
+# for each model
+loo_weighted_simple <- compute_loo(samples_simple)
+loo_weighted_self_foc <- compute_loo(samples_weighted_self_focused)
+loo_weighted_soc_inf <- compute_loo(samples_weighted_socially_focused)
+
+# display
+loo_weighted_simple
+
+loo_weighted_self_foc
+
+loo_weighted_soc_inf
+
+?loo
+
+```
+
+# Checking the reliability of our LOO estimates
+PSIS-LOO provides diagnostics through the Pareto k values (which it cannot calculate due to the model being fully deterministic, but here goes)
+```{r}
+# From the course notes: function to check Pareto k diagnostics
+check_pareto_k <- function(loo_result, model_name) {
+  # Extract Pareto k values
+  pareto_k <- loo_result$diagnostics$pareto_k
+  
+  # Count problematic k values
+  n_k_high <- sum(pareto_k > 0.7)
+  n_k_medium <- sum(pareto_k > 0.5 & pareto_k <= 0.7)
+  
+  # Proportion of problematic observations
+  prop_problematic <- (n_k_high + n_k_medium) / length(pareto_k)
+  
+  # Create diagnostic summary
+  summary_df <- tibble(
+    model = model_name,
+    total_obs = length(pareto_k),
+    k_high = n_k_high,
+    k_medium = n_k_medium,
+    prop_problematic = prop_problematic,
+    reliability = case_when(
+      prop_problematic == 0 ~ "Excellent",
+      prop_problematic < 0.05 ~ "Good",
+      prop_problematic < 0.1 ~ "Fair",
+      TRUE ~ "Poor"
+    )
+  )
+  
+  return(summary_df)
+}
+
+# Check diagnostics for all models
+diagnostics <- bind_rows(
+  check_pareto_k(loo_weighted_simple, "Weighted - Balanced"),
+  check_pareto_k(loo_weighted_self_foc, "Weighted - Self-Focused"),
+  check_pareto_k(loo_weighted_soc_inf, "Weighted - Socially-Influenced"))
+
+# Display diagnostics table
+knitr::kable(diagnostics, 
+             digits = 3,
+             caption = "PSIS-LOO Reliability Diagnostics")
+```
+
+
+```{r}
+# Model quality check
+
+# Function to create trace and rank plots for a model
+create_diagnostic_plots <- function(fit, model_name) {
+  # Extract posterior draws
+  draws <- as_draws_df(fit$draws()) 
+  
+  trace_data <- data.frame(
+    Iteration = rep(1:(nrow(draws)/length(unique(draws$.chain))), 
+                    length(unique(draws$.chain))),
+    Chain = draws$.chain,
+    weight_direct = draws$weight_direct,
+    weight_social = draws$weight_social,
+    total_weight = draws$total_weight,
+    weight_prop = draws$weight_prop
+  )
+  
+  # Create trace plot
+  trace_plot1 <- ggplot(trace_data, aes(x = Iteration, y = weight_direct, color = factor(Chain))) +
+    geom_line() +
+    labs(title = paste("Trace plot for weight_direct"),
+         x = "Iteration",
+         y = "weight_direct",
+         color = "Chain") +
+    theme_minimal() +
+    theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+  
+  trace_plot2 <- ggplot(trace_data, aes(x = Iteration, y = weight_social, color = factor(Chain))) +
+    geom_line() +
+    labs(title = paste("Trace Plot for weight_social"),
+         x = "Iteration",
+         y = "weight_social",
+         color = "Chain") +
+    theme_minimal() +
+    theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+  
+  trace_plot3 <- ggplot(trace_data, aes(x = Iteration, y = total_weight, color = factor(Chain))) +
+    geom_line() +
+    labs(title = paste("Trace Plot for total_weight"),
+         x = "Iteration",
+         y = "total_weight",
+         color = "Chain") +
+    theme_minimal() +
+    theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+  
+  trace_plot4 <- ggplot(trace_data, aes(x = Iteration, y = total_weight, color = factor(Chain))) +
+    geom_line() +
+    labs(title = paste("Trace Plot for weight_prop"),
+         x = "Iteration",
+         y = "weight_prop",
+         color = "Chain") +
+    theme_minimal() +
+    theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+  
+  # Combine plots using patchwork 
+  combined_trace_plot <- (trace_plot1 + trace_plot2) / (trace_plot3 + trace_plot4) +
+    plot_annotation(title = paste("Trace Plots for", model_name))
+  
+  # Return the plots
+  return(combined_trace_plot)
+}
+
+# Generate diagnostic plots for the weighted models 
+#create_diagnostic_plots(samples_simple, "Simple Model")
+create_diagnostic_plots(samples_weighted_self_focused, "Weighted Self-Focused Model")
+create_diagnostic_plots(samples_weighted_socially_focused, "Weighted Socially-Influenced Model")
+```
+
+
+
+## Fit the weighted stan model to real data
+
+
+```{r}
+# Make simonsen data into list fomat 
+data_simonsen <- list(
+  n = 6120,
+  f = simonsen$FirstRating,
+  g = simonsen$GroupRating,
+  s = simonsen$SecondRating,
+  fe = simonsen$Feedback,
+  c = simonsen$Change 
+)
+
+# Specify path to stan model and load 
+#file<- file.path("model_portfolio_3.stan")
+file <- file.path("weighted_stan.stan")
+
+
+mod_weighted_real <- cmdstan_model(file, 
+                     cpp_options = list(stan_threads = TRUE),
+                     stanc_options = list("O1"))
+
+
+# The following command calls Stan with specific options
+samples_real <- mod_weighted_real$sample(
+  data = data_simonsen,
+  seed = 123,
+  chains = 2, 
+  parallel_chains = 2, 
+  threads_per_chain = 2, 
+  iter_warmup = 1000,
+  iter_sampling = 1000,
+  refresh = 0,
+  max_treedepth = 20,
+  adapt_delta = 0.99,
+)
+
+# Print a summary of the model
+samples_real$summary()
+samples_real$cmdstan_diagnose()
+```
+
+
+
+
+
+
+
