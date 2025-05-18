@@ -212,7 +212,7 @@ for (subj in unique(sim_data$subject)) {
     filter(subject == subj)
   
   # Simulate responses for this subject
-  simulated_responses <- simulate_responses(data = sim_data_subj, agent = "equal weights", w = "equal", c = 3)
+  simulated_responses <- simulate_responses(data = sim_data_subj, agent = "equal weights", w = "equal", c = 1)
   
   # Combine the results
   all_simulated_responses <- bind_rows(all_simulated_responses, simulated_responses)
@@ -231,6 +231,7 @@ saveRDS(simulated_responses, "last_sub_responses.rds")
 all_simulated_responses <- readRDS("all_simulated_responses.rds")
 simulated_responses <- readRDS("last_sub_responses.rds")
 ```
+
 
 # Only work with session 1
 ```{r}
@@ -324,22 +325,15 @@ for (subj in subject_ids) {
   model_fits[[as.character(subj)]] <- fit
 }
 
-# Print summary 
-for (subj in names(model_fits)) {
-  cat("\n--- Summary for Subject", subj, "---\n")
-  print(model_fits[[subj]]$summary())
-}
-
 
 # Print diagnostics 
-# for (subj in names(model_fits)) {
-#   cat("\n--- Diagnostics for Subject", subj, "---\n")
-#   print(model_fits[[subj]]$cmdstan_diagnose())
-# }
-
-# Print and save diagnostics per subject
 for (subj in names(model_fits)) {
-  cat("\n--- Summary for Subject", subj, "---\n")
+   cat("\n--- Diagnostics for Subject", subj, "---\n")
+   print(model_fits[[subj]]$cmdstan_diagnose())
+}
+
+# Print and save diagnostics per subject (to be used later)
+for (subj in names(model_fits)) {
   
   # Extract summary and convert to tibble
   diagnostics <- model_fits[[subj]]$summary() %>% as_tibble()
@@ -354,12 +348,43 @@ for (subj in names(model_fits)) {
   print(diagnostics)
 }
 
-# Plot traceplots
+
+
+# Plot prior-posterior updates and traceplots
 for (subj in names(model_fits)) {
-  cat("Generating traceplots for subject:", subj, "\n")
   
   # Extract posterior draws
   draws <- as_draws_df(model_fits[[subj]]$draws())
+
+  
+  # Prior-posterior update checks for w's
+  w_prior_pos <- lapply(1:5, function(i) {
+    ggplot(draws)+
+      geom_density(aes(x = .data[[paste0("w[", i, "]")]]), alpha = 3, fill = "lightblue") +
+      geom_density(aes(x = .data[[paste0("w_prior[", i, "]")]]), alpha = 3, fill = "pink") +
+      geom_vline(xintercept = 0.2, size = 1) + 
+      theme_classic() + 
+      ggtitle(paste("Prior-Posterior Update for w[", i, "]", sep = "")) +
+      xlab(paste0("w[", i, "]")) +
+      ylab("Posterior Density")
+  })
+  
+  # Prior-posterior update checks for c
+  c_prior_pos <- ggplot(draws) +
+    geom_density(aes(c), alpha = 3, fill = "lightblue") +
+    geom_density(aes(c_prior), alpha = 3, fill = "pink") +
+    geom_vline(xintercept = 1, size = 1) + 
+    theme_classic() + 
+    ggtitle("Prior-Posterior Update for c") +
+    xlab("c") +
+    ylab("Posterior Density")
+  
+  # Combine the prior-posterior update checks
+  grid_plots <- c(w_prior_pos, list(c_prior_pos))
+  grid.arrange(grobs = grid_plots, 
+               ncol = 2, 
+               top = paste("Prior-posterior update checks - Subject", subj),
+               bottom = "Prior = pink, Posterior = blue")
   
   # Traceplots for w's
   w_plots <- lapply(1:5, function(i) {
@@ -376,7 +401,7 @@ for (subj in names(model_fits)) {
     theme_classic() +
     ggtitle("c")
   
-  # Combine 
+  # Combine the traceplots
   grid_plots <- c(w_plots, list(c_plot))
   grid.arrange(grobs = grid_plots, ncol = 2, top = paste("Traceplots - Subject", subj))
 }
@@ -384,28 +409,29 @@ for (subj in names(model_fits)) {
 
 ```
 
+
 # Combine the diagnostic putputs
 ```{r}
 # Get the data frames into the right shape
 subj_1 <- subject_1_diagnostics %>% 
   filter(variable == "lp__"|variable == "w[1]"|variable == "w[2]"|variable == "w[3]"|variable == "w[4]"|variable == "w[5]"|variable == "c") %>% 
-  select(variable, mean, median, sd, mad)
+  dplyr::select(variable, mean, median, sd, mad)
 
 subj_2 <- subject_2_diagnostics %>% 
   filter(variable == "lp__"|variable == "w[1]"|variable == "w[2]"|variable == "w[3]"|variable == "w[4]"|variable == "w[5]"|variable == "c") %>% 
-  select(variable, mean, median, sd, mad)
+  dplyr::select(variable, mean, median, sd, mad)
 
 subj_3 <- subject_3_diagnostics %>% 
   filter(variable == "lp__"|variable == "w[1]"|variable == "w[2]"|variable == "w[3]"|variable == "w[4]"|variable == "w[5]"|variable == "c") %>% 
-  select(variable, mean, median, sd, mad)
+  dplyr::select(variable, mean, median, sd, mad)
 
 subj_4 <- subject_4_diagnostics %>% 
   filter(variable == "lp__"|variable == "w[1]"|variable == "w[2]"|variable == "w[3]"|variable == "w[4]"|variable == "w[5]"|variable == "c") %>% 
-  select(variable, mean, median, sd, mad)
+  dplyr::select(variable, mean, median, sd, mad)
 
 subj_5 <- subject_5_diagnostics %>% 
   filter(variable == "lp__"|variable == "w[1]"|variable == "w[2]"|variable == "w[3]"|variable == "w[4]"|variable == "w[5]"|variable == "c") %>% 
-  select(variable, mean, median, sd, mad)
+  dplyr::select(variable, mean, median, sd, mad)
 
 
 # Combine the data frames
@@ -421,7 +447,6 @@ mean_data <- combined_data %>%
             mad_value = mad(mean))
 mean_data
 ```
-
 
 
 # The emperical data
@@ -461,6 +486,7 @@ df %>%
 
 # Overall mean of correct
 df %>% 
+  ungroup() %>% 
   summarize(mean(correct, na.rm = TRUE))
 
 # Performance over time 
@@ -481,16 +507,16 @@ ggplot(df, aes(x = trial, y = performance, color = as.factor(subject))) +
   theme_minimal()  
 ```
 
-
 # Reduce the dimensions in the real data (since we are not using "nutritious")
 
 Responses are 1-4, where 3 and 4 indicate danger, 1 and 2 not danger; 2 and 4 indicate nutritious, 1 and 3 not nutritious
 
 Category: the category to which the alien belongs. 1: peaceful/non-nutritious, 2: peaceful/nutritious, 3: dangerous/non-nutritious, 4: dangerous/nutritious.
+
 ```{r}
 # Reduce from 2 dimension (dangerous/nutritious) to 1 dimension (dangerous)
 df <- df %>% 
-  select(-nutricious, -category) %>% 
+  dplyr::select(-nutricious, -category) %>% 
   mutate(response_new = case_when(
     response == 1 ~ 0,
     response == 2 ~ 0,
@@ -589,24 +615,17 @@ for (subj in subject_ids) {
   model_fits_emp[[as.character(subj)]] <- fit
 }
 
-# Print summary 
-for (subj in names(model_fits_emp)) {
-  cat("\n--- Summary for Subject", subj, "---\n")
-  print(model_fits_emp[[subj]]$summary())
-}
-
 
 # Print diagnostics 
-# for (subj in names(model_fits_emp)) {
-#   cat("\n--- Diagnostics for Subject", subj, "---\n")
-#   print(model_fits_emp[[subj]]$cmdstan_diagnose())
-# }
-
-# Print and save diagnostics per subject
 for (subj in names(model_fits_emp)) {
-  cat("\n--- Summary for Subject", subj, "---\n")
-  
-  # Extract summary and convert to tibble
+   cat("\n--- Diagnostics for Subject", subj, "---\n")
+   print(model_fits[[subj]]$cmdstan_diagnose())
+}
+
+# Print and save diagnostics per subject (to be used later)
+for (subj in names(model_fits_emp)) {
+
+  #Extract summary and convert to tibble
   diagnostics <- model_fits_emp[[subj]]$summary() %>% as_tibble()
   
   # Assign subject name 
@@ -621,10 +640,38 @@ for (subj in names(model_fits_emp)) {
 
 # Plot traceplots
 for (subj in names(model_fits_emp)) {
-  cat("Generating traceplots for subject:", subj, "\n")
   
   # Extract posterior draws
   draws <- as_draws_df(model_fits_emp[[subj]]$draws())
+  
+  # Prior-posterior update checks for w's
+  w_prior_pos <- lapply(1:5, function(i) {
+    ggplot(draws)+
+      geom_density(aes(x = .data[[paste0("w[", i, "]")]]), alpha = 3, fill = "lightblue") +
+      geom_density(aes(x = .data[[paste0("w_prior[", i, "]")]]), alpha = 3, fill = "pink") +
+      geom_vline(xintercept = 0.2, size = 1) + 
+      theme_classic() + 
+      ggtitle(paste("Prior-Posterior Update for w[", i, "]", sep = "")) +
+      xlab(paste0("w[", i, "]")) +
+      ylab("Posterior Density")
+  })
+  
+  # Prior-posterior update checks for c
+  c_prior_pos <- ggplot(draws) +
+    geom_density(aes(c), alpha = 3, fill = "lightblue") +
+    geom_density(aes(c_prior), alpha = 3, fill = "pink") +
+    geom_vline(xintercept = 1, size = 1) + 
+    theme_classic() + 
+    ggtitle("Prior-Posterior Update for c") + 
+    xlab("c") +
+    ylab("Posterior Density")
+  
+  # Combine the prior-posterior update checks
+  grid_plots <- c(w_prior_pos, list(c_prior_pos))
+  grid.arrange(grobs = grid_plots, 
+               ncol = 2, 
+               top = paste("Prior-posterior update checks - Subject", subj),
+               bottom = "Prior = pink, Posterior = blue")
   
   # Traceplots for w's
   w_plots <- lapply(1:5, function(i) {
@@ -648,28 +695,30 @@ for (subj in names(model_fits_emp)) {
 
 ```
 
+
+
 # Combine the diagnostic outputs
 ```{r}
 # Get the data frames into the right shape
 subj_1_empirical <- subject_1_diagnostics_empirical %>% 
   filter(variable == "lp__"|variable == "w[1]"|variable == "w[2]"|variable == "w[3]"|variable == "w[4]"|variable == "w[5]"|variable == "c") %>% 
-  select(variable, mean, median, sd, mad)
+  dplyr::select(variable, mean, median, sd, mad)
 
 subj_2_empirical <- subject_2_diagnostics_empirical %>% 
   filter(variable == "lp__"|variable == "w[1]"|variable == "w[2]"|variable == "w[3]"|variable == "w[4]"|variable == "w[5]"|variable == "c") %>% 
-  select(variable, mean, median, sd, mad)
+  dplyr::select(variable, mean, median, sd, mad)
 
 subj_3_empirical <- subject_3_diagnostics_empirical %>% 
   filter(variable == "lp__"|variable == "w[1]"|variable == "w[2]"|variable == "w[3]"|variable == "w[4]"|variable == "w[5]"|variable == "c") %>% 
-  select(variable, mean, median, sd, mad)
+  dplyr::select(variable, mean, median, sd, mad)
 
 subj_4_empirical <- subject_4_diagnostics_empirical %>% 
   filter(variable == "lp__"|variable == "w[1]"|variable == "w[2]"|variable == "w[3]"|variable == "w[4]"|variable == "w[5]"|variable == "c") %>% 
-  select(variable, mean, median, sd, mad)
+  dplyr::select(variable, mean, median, sd, mad)
 
 subj_5_empirical <- subject_5_diagnostics_empirical %>% 
   filter(variable == "lp__"|variable == "w[1]"|variable == "w[2]"|variable == "w[3]"|variable == "w[4]"|variable == "w[5]"|variable == "c") %>% 
-  select(variable, mean, median, sd, mad)
+  dplyr::select(variable, mean, median, sd, mad)
 
 
 # Combine the data frames
@@ -683,6 +732,7 @@ mean_data_empirical <- combined_data_empirical %>%
             median_value = median(mean),
             sd_value = sd(mean),
             mad_value = mad(mean))
-```
 
+mean_data_empirical
+```
 
